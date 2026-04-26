@@ -1,7 +1,8 @@
 # tubelens runtime artifacts
 .channel_cache/
-channel_synthesis.md
-*.synth.md
+*_top*_result.md
+*_all_result.md
+*_result.md
 
 # Python
 __pycache__/

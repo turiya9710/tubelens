@@ -16,9 +16,14 @@ Setup:
 
 Usage:
     python tubelens.py "https://www.youtube.com/@channelname"
-    python tubelens.py "https://www.youtube.com/@channelname" --limit 50
-    python tubelens.py "https://www.youtube.com/@channelname" --skip-shorts
-    python tubelens.py "https://www.youtube.com/@channelname" --reduce-model sonnet
+
+Defaults: --limit 20, --skip-shorts, --reduce-model sonnet, output = <handle>_result.md
+
+Override:
+    python tubelens.py "https://www.youtube.com/@channelname" --limit 0          # full channel
+    python tubelens.py "https://www.youtube.com/@channelname" --include-shorts   # shorts on
+    python tubelens.py "https://www.youtube.com/@channelname" --reduce-model opus
+    python tubelens.py "https://www.youtube.com/@channelname" --output custom.md
 
 Cost: ~$0.50-1.00 for a 200-video channel (with prompt caching, default models).
 Re-runs are free — transcripts and summaries are cached on disk.
@@ -36,6 +41,7 @@ from pathlib import Path
 
 import yt_dlp
 from anthropic import Anthropic
+from dotenv import load_dotenv
 from tqdm import tqdm
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -81,30 +87,60 @@ def list_channel_videos(channel_url: str, skip_shorts: bool = False) -> list[Vid
     videos: list[Video] = []
     ydl_opts = {
         "quiet": True,
-        "extract_flat": True,
+        "extract_flat": "in_playlist",  # walk into nested tabs but don't fetch each video
         "skip_download": True,
         "ignoreerrors": True,
     }
+
+    def walk_entries(node, is_short_hint: bool):
+        """Recursively yield video entries. yt-dlp wraps channel pages in nested
+        playlist objects (Videos/Shorts/Live as sub-playlists) — we have to walk
+        through them rather than assuming entries are videos directly."""
+        if not node:
+            return
+        for entry in node.get("entries", []) or []:
+            if not entry:
+                continue
+            entry_type = entry.get("_type") or ""
+            # If this entry is itself a playlist/tab, recurse into it.
+            if entry_type in ("playlist", "url") and "entries" in entry:
+                # Hint: nested "Shorts" tab implies shorts
+                tab_title = (entry.get("title") or "").lower()
+                next_hint = is_short_hint or "short" in tab_title
+                walk_entries(entry, next_hint)
+                continue
+            # Otherwise treat as a video entry. Need an id.
+            vid = entry.get("id")
+            if not vid:
+                continue
+            videos.append(Video(
+                video_id=vid,
+                title=entry.get("title", "") or "",
+                upload_date=str(entry.get("upload_date", "") or ""),
+                duration=int(entry.get("duration") or 0),
+                is_short=is_short_hint,
+            ))
 
     for tab_url, is_short in tabs:
         print(f"[list] scanning {tab_url}")
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(tab_url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            # Common, harmless: channel may not have a /shorts tab
+            msg = str(e)
+            if "does not have a shorts tab" in msg or "does not have a videos tab" in msg:
+                print(f"[list]   (no {'shorts' if is_short else 'videos'} tab on this channel)")
+            else:
+                print(f"[list]   skipped ({msg[:120]})")
+            continue
         except Exception as e:
-            print(f"[list]   skipped ({e})")
+            print(f"[list]   skipped ({type(e).__name__}: {e})")
             continue
 
-        for entry in (info or {}).get("entries", []) or []:
-            if not entry or not entry.get("id"):
-                continue
-            videos.append(Video(
-                video_id=entry["id"],
-                title=entry.get("title", "") or "",
-                upload_date=str(entry.get("upload_date", "") or ""),
-                duration=int(entry.get("duration") or 0),
-                is_short=is_short,
-            ))
+        before = len(videos)
+        walk_entries(info, is_short)
+        print(f"[list]   found {len(videos) - before} entries in this tab")
 
     # Dedupe — a video can occasionally appear in both tabs
     seen = set()
@@ -121,7 +157,10 @@ def list_channel_videos(channel_url: str, skip_shorts: bool = False) -> list[Vid
 # ---------- Step 2: fetch transcripts ----------
 
 def fetch_transcript(video: Video) -> Video:
-    """Fetch transcript with on-disk caching. Prefers manual captions over auto."""
+    """Fetch transcript with on-disk caching. Prefers manual captions over auto.
+
+    Uses youtube-transcript-api v1.0+ instance API (list_transcripts was removed).
+    """
     cache_file = CACHE_DIR / f"{video.video_id}.json"
     if cache_file.exists():
         data = json.loads(cache_file.read_text())
@@ -130,18 +169,28 @@ def fetch_transcript(video: Video) -> Video:
         return video
 
     try:
+        # v1.0+ API: instance, not class methods
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.list(video.video_id)
+
         # Prefer English manual captions; fall back to auto-generated.
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video.video_id)
         try:
             tr = transcript_list.find_manually_created_transcript(["en", "en-US", "en-GB"])
         except NoTranscriptFound:
-            tr = transcript_list.find_generated_transcript(["en"])
-        chunks = tr.fetch()
-        video.transcript = " ".join(c["text"].replace("\n", " ") for c in chunks).strip()
+            tr = transcript_list.find_generated_transcript(["en", "en-US", "en-GB"])
+
+        fetched = tr.fetch()
+        # FetchedTranscript has a .snippets attribute (list of FetchedTranscriptSnippet
+        # objects with .text). It's also iterable directly.
+        snippets = fetched.snippets if hasattr(fetched, "snippets") else fetched
+        video.transcript = " ".join(
+            (s.text if hasattr(s, "text") else s["text"]).replace("\n", " ")
+            for s in snippets
+        ).strip()
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
         video.error = type(e).__name__
     except Exception as e:
-        video.error = f"unexpected: {e}"
+        video.error = f"unexpected: {type(e).__name__}: {e}"
 
     cache_file.write_text(json.dumps({
         "transcript": video.transcript,
@@ -159,6 +208,21 @@ def fetch_all_transcripts(videos: list[Video], workers: int = 8) -> list[Video]:
             out.append(fut.result())
     got = sum(1 for v in out if v.transcript)
     print(f"[transcripts] {got}/{len(out)} videos have transcripts")
+
+    # If anything failed, summarize why — silent failures are the worst kind of bug
+    failures = [v for v in out if not v.transcript and v.error]
+    if failures:
+        from collections import Counter
+        reasons = Counter(v.error.split(":")[0] for v in failures)
+        print(f"[transcripts] failure breakdown: {dict(reasons)}")
+        # Show one example of each unique error verbatim, for debugging
+        seen_keys = set()
+        for v in failures:
+            key = v.error.split(":")[0]
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            print(f"[transcripts]   example ({v.video_id}): {v.error}")
     return out
 
 
@@ -270,6 +334,23 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
     summarized = [v for v in videos if v.summary and v.summary != "SKIP"]
     summarized.sort(key=lambda v: v.upload_date)
 
+    if not summarized:
+        msg = (
+            "[reduce] no per-video summaries to synthesize — skipping the reduce step.\n"
+            "         (this usually means transcripts couldn't be fetched; see "
+            "the [transcripts] failure breakdown above)"
+        )
+        print(msg)
+        output_path.write_text(
+            "# tubelens — no synthesis produced\n\n"
+            "No video transcripts were available, so there was nothing to summarize.\n\n"
+            "Common causes:\n"
+            "- The channel disables auto-captions on its videos\n"
+            "- youtube-transcript-api is being rate-limited or IP-blocked\n"
+            "- A library version mismatch (run: pip install -U youtube-transcript-api)\n"
+        )
+        return msg
+
     blocks = []
     for v in summarized:
         fmt = "SHORT" if v.is_short else "VIDEO"
@@ -332,37 +413,111 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
     return final
 
 
+def _derive_output_path(
+    channel_url: str,
+    explicit: str | None,
+    processed_count: int,
+    limit_arg: int,
+) -> Path:
+    """Default output filename: <handle>_top<N>_result.md (or _all_ if --limit 0).
+
+    Uses the actual processed count for accuracy. Uses 'all' only when the user
+    explicitly opted into the full channel with --limit 0, so users can tell
+    "I asked for everything" runs apart from "the channel happens to be small."
+
+    Examples:
+        @chamath (4 vids, default limit=20)  -> chamath_top4_result.md
+        @hubermanlab --limit 50              -> hubermanlab_top50_result.md
+        @hubermanlab --limit 0  (300 videos) -> hubermanlab_all_result.md
+        @chamath --limit 0      (4 videos)   -> chamath_all_result.md
+    """
+    if explicit:
+        return Path(explicit)
+
+    # Strip trailing /videos or /shorts and any query/fragment, then take the last
+    # path segment. Falls back to "channel" if we can't pick out anything sensible.
+    cleaned = re.sub(r"[?#].*$", "", channel_url.rstrip("/"))
+    cleaned = cleaned.removesuffix("/videos").removesuffix("/shorts")
+    handle = cleaned.rsplit("/", 1)[-1] or "channel"
+    handle = handle.lstrip("@") or "channel"
+    # Be conservative about filesystem-unsafe chars
+    handle = re.sub(r"[^A-Za-z0-9_.-]", "_", handle)
+
+    # 'all' only when the user explicitly asked for the full channel (--limit 0).
+    # Otherwise reflect what was actually processed.
+    scope = "all" if limit_arg == 0 else f"top{processed_count}"
+    return Path(f"{handle}_{scope}_result.md")
+
+
 # ---------- main ----------
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="tubelens — Stop watching YouTube. Start querying it.",
+    )
     ap.add_argument("channel_url", help="e.g. https://www.youtube.com/@channelname")
-    ap.add_argument("--limit", type=int, default=0, help="cap number of videos (0 = all)")
-    ap.add_argument("--skip-shorts", action="store_true")
-    ap.add_argument("--output", default="channel_synthesis.md")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="cap number of videos to process (default: 20). Use --limit 0 for the full channel.",
+    )
+    # Shorts off by default. Users opt in with --include-shorts.
+    shorts_group = ap.add_mutually_exclusive_group()
+    shorts_group.add_argument(
+        "--skip-shorts",
+        dest="skip_shorts",
+        action="store_true",
+        default=True,
+        help="ignore the /shorts tab (default)",
+    )
+    shorts_group.add_argument(
+        "--include-shorts",
+        dest="skip_shorts",
+        action="store_false",
+        help="include /shorts in the synthesis",
+    )
+    ap.add_argument(
+        "--output",
+        default=None,
+        help="output filename (default: <channelhandle>_result.md)",
+    )
     ap.add_argument(
         "--reduce-model",
         choices=["opus", "sonnet"],
-        default="opus",
-        help="opus = best quality (default), sonnet = ~5x cheaper for iterating on the synthesis prompt",
+        default="sonnet",
+        help="sonnet = ~5x cheaper (default, good quality), opus = best quality for final runs",
     )
     args = ap.parse_args()
 
+    # Load ANTHROPIC_API_KEY from .env if present. Existing env vars take precedence
+    # (so CI/secret managers override the .env file without surprise).
+    load_dotenv()
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("Set ANTHROPIC_API_KEY in your environment.")
+        sys.exit(
+            "ANTHROPIC_API_KEY not found.\n"
+            "Copy .env.example to .env and add your key, "
+            "or set ANTHROPIC_API_KEY in your environment."
+        )
 
     reduce_model = REDUCE_MODEL if args.reduce_model == "opus" else REDUCE_MODEL_CHEAP
 
     videos = list_channel_videos(args.channel_url, skip_shorts=args.skip_shorts)
-    if args.limit:
+    total_found = len(videos)
+    if args.limit and total_found > args.limit:
         videos = videos[: args.limit]
+        print(
+            f"[limit] processing first {args.limit} of {total_found} videos. "
+            f"Use --limit 0 to process the whole channel."
+        )
     if not videos:
         sys.exit("No videos found.")
 
     videos = fetch_all_transcripts(videos)
     videos = summarize_all(videos)
 
-    out_path = Path(args.output)
+    out_path = _derive_output_path(args.channel_url, args.output, len(videos), args.limit)
     final = synthesize(videos, out_path, model=reduce_model)
     print(f"\n[done] wrote {out_path}")
     print("\n" + "=" * 60)

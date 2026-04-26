@@ -1,5 +1,9 @@
 # tubelens
 
+<p align="center">
+  <img src="./assets/tubelens_hero_header.png" alt="tubelens hero banner" width="700">
+</p>
+
 > **Stop Watching YouTube. Start Querying It.**
 
 Absorb an entire YouTube channel — every video and short — in minutes, without watching a single second.
@@ -26,16 +30,56 @@ For people who just want to run it.
 ```bash
 git clone https://github.com/turiya9710/tubelens.git
 cd tubelens
+```
+
+Create a virtual environment so `tubelens` dependencies stay isolated from your system Python:
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it — **the command depends on your shell**:
+
+```bash
+source .venv/bin/activate          # bash / zsh (macOS/Linux default)
+source .venv/bin/activate.csh      # tcsh / csh
+source .venv/bin/activate.fish     # fish
+.venv\Scripts\activate.bat         # Windows cmd
+.venv\Scripts\Activate.ps1         # Windows PowerShell
+```
+
+> If you see `Badly placed ()'s.` you're in tcsh/csh — use the `.csh` variant above. The default `activate` script is bash-syntax and can't be sourced by csh-family shells.
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
+When you're done with a session, `deactivate` exits the venv. Re-activate with the same command above next time.
+
 ### 2. Set your API key
 
+`tubelens` reads `ANTHROPIC_API_KEY` from a `.env` file in the project root. **Don't paste the key into your shell history or commit it to git.**
+
+Create `.env`:
+
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+cp .env.example .env
+```
+
+Open `.env` in your editor and paste your key:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Get one at [console.anthropic.com](https://console.anthropic.com). You'll need credits — see [Cost](#cost-breakdown) below.
+
+`.env` is already listed in `.gitignore`, so it won't be committed. Verify with `git status` before your first push.
+
+> **Why `.env` and not `export`?**
+> An `export` command lives in your shell history (`~/.bash_history`, `~/.zsh_history`) in plain text. A `.env` file stays out of version control and out of shell history. For team or CI use, swap `.env` for your platform's secret manager (GitHub Actions secrets, AWS Secrets Manager, Azure Key Vault, etc.).
 
 ### 3. Run
 
@@ -43,15 +87,17 @@ Get one at [console.anthropic.com](https://console.anthropic.com). You'll need c
 python tubelens.py "https://www.youtube.com/@channelname"
 ```
 
-Output lands in `channel_synthesis.md`. Open it in any markdown viewer.
+Output lands in `<channelhandle>_top<N>_result.md` (e.g. `chamath_top4_result.md`, `hubermanlab_top20_result.md`). Running with `--limit 0` produces `<handle>_all_result.md`. Open in any markdown viewer.
+
+**Default behavior:** processes up to 20 most recent videos, skips shorts, uses Claude Sonnet 4.6 for the synthesis. These defaults are tuned for fast, cheap first runs — under $0.10 for most channels. Override anything below.
 
 ### Common flags
 
 ```bash
---limit 20             # cap to first 20 videos (great for testing)
---skip-shorts          # ignore the /shorts tab
---output my_synth.md   # custom output filename
---reduce-model sonnet  # use cheaper model for the final synthesis (5x cheaper)
+--limit 0              # process the whole channel (default: 20 most recent)
+--include-shorts       # include /shorts (default: skipped)
+--output custom.md     # custom output filename (default: <handle>_top<N>_result.md or <handle>_all_result.md)
+--reduce-model opus    # use Opus 4.7 for highest-quality synthesis (default: sonnet, ~5x cheaper)
 ```
 
 That's it. Skip to [Examples](#example-output) to see what you get.
@@ -63,6 +109,10 @@ That's it. Skip to [Examples](#example-output) to see what you get.
 For people who want to understand and customize.
 
 ### How it works
+
+<p align="center">
+  <img src="./assets/tubelens_github_social_card.png" alt="tubelens pipeline: list, fetch, map, reduce" width="700">
+</p>
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -101,35 +151,46 @@ For people who want to understand and customize.
   └──────────────────────────────────────────────────────────┘
       │
       ▼
-  channel_synthesis.md
+  <handle>_top<N>_result.md  (or <handle>_all_result.md with --limit 0)
 ```
 
-**Why this shape:** the map step is high-volume but easy (just summarize one video), so it runs on the cheapest model with caching. The reduce step is low-volume but hard (find patterns across hundreds of summaries), so it runs on the strongest model. This is the standard map-reduce pattern adapted for LLMs.
+**Why this shape:** the map step is high-volume but easy (just summarize one video), so it runs on the cheapest model with caching. The reduce step is low-volume but hard (find patterns across hundreds of summaries), so it runs on a stronger model. This is the standard map-reduce pattern adapted for LLMs.
 
 **Why caching matters:** every step writes to `.channel_cache/`. Re-running with a tweaked synthesis prompt costs almost nothing — only the reduce step re-executes. Iterating on the prompt becomes effectively free.
 
 ### Cost breakdown
 
-Real numbers for a 200-video channel of mid-length videos (~10–15 min average):
+<p align="center">
+  <img src="./assets/tubelens_cost_comparison.png" alt="Cost comparison between naive summarization and map-reduce" width="700">
+</p>
+
+**Default run (20 videos, Sonnet for reduce):**
 
 | Step    | Model        | Cost          | Notes                                          |
 | ------- | ------------ | ------------- | ---------------------------------------------- |
 | List    | (yt-dlp)     | $0.00         | Local, no API                                  |
-| Fetch   | (youtube-api)| $0.00         | Local, no API                                  |
-| Map     | Haiku 4.5    | ~$0.30–0.50   | Prompt caching cuts ~60% off the static prefix |
-| Reduce  | Opus 4.7     | ~$0.30–0.50   | One call (or chunked + merge for huge channels)|
-| **Total** |            | **~$0.60–1.00** | First run. Re-runs ~$0.30 (reduce only).     |
+| Fetch   | (transcript) | $0.00         | Local, no API                                  |
+| Map     | Haiku 4.5    | ~$0.03–0.05   | 20 videos, prompt caching active               |
+| Reduce  | Sonnet 4.6   | ~$0.05–0.10   | Single call                                    |
+| **Total** |            | **~$0.10**    | Most channels' first run lands here            |
+
+**Full channel run (`--limit 0`, ~200 videos, Opus for reduce):**
+
+| Step    | Model        | Cost          |
+| ------- | ------------ | ------------- |
+| Map     | Haiku 4.5    | ~$0.30–0.50   |
+| Reduce  | Opus 4.7     | ~$0.30–0.50   |
+| **Total** |            | **~$0.60–1.00** |
+
+Re-runs (after editing the synthesis prompt) cost only the reduce step — typically $0.05–0.50 depending on model.
+
 
 **Token math, simplified:**
-- Map step: `N × (~500 tokens prompt + ~6,000 tokens transcript + ~300 tokens output)`. The 500-token prompt is cached, so after the first call it bills at 10% of normal input rate.
-- Reduce step: `~600 chars × N summaries ≈ 30k tokens input + 4k tokens output`. Single call.
-
-**Cheaper modes:**
-- `--reduce-model sonnet` drops the reduce cost ~5x. Use this while iterating on the synthesis prompt.
-- `--limit 20` for a fast first taste — you'll already see the channel's main themes from 20 videos.
+- Map step: `N × (~150 tokens prompt + ~6,000 tokens transcript + ~250 tokens output)`. The static prompt prefix is cached, billing at ~10% of normal input rate after the first call.
+- Reduce step: `~600 chars × N summaries ≈ 30k tokens input + 4k tokens output`. Single call (or chunked for very large channels).
 
 **More expensive scenarios:**
-- Channels with very long videos (1hr+ podcasts): map cost scales linearly. Consider lowering `TRANSCRIPT_TRUNCATE` in the script.
+- Channels with very long videos (1hr+ podcasts): map cost scales linearly with transcript length. Consider lowering `TRANSCRIPT_TRUNCATE` in the script.
 - Huge channels (500+ videos) trigger the chunked reduce + merge pass. Adds maybe $0.50.
 
 ### Example output
