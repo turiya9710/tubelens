@@ -1,5 +1,7 @@
-yt-dlp>=2024.10.0
-youtube-transcript-api>=0.6.2
-anthropic>=0.40.0
-tqdm>=4.66.0
-python-dotenv>=1.0.0
+# Requirements · TXT
+yt-dlp>=2026.10.26
+youtube-transcript-api>=1.2.4
+anthropic>=1.8.0
+tqdm>=4.70.1
+python-dotenv>=1.2.4
+boto3>=1.43.123

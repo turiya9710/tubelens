@@ -14,7 +14,7 @@ Pipeline (channel mode):
     4. Claude Opus      -> cross-video synthesis ("reduce" step)
 
 Setup:
-    pip install yt-dlp youtube-transcript-api anthropic tqdm
+    pip install yt-dlp youtube-transcript-api anthropic tqdm boto3
     export ANTHROPIC_API_KEY=sk-ant-...
 
 Usage (channel):
@@ -33,6 +33,12 @@ Override:
     python tubelens.py "https://www.youtube.com/@channelname" --include-shorts   # shorts on
     python tubelens.py "https://www.youtube.com/@channelname" --reduce-model opus
     python tubelens.py "https://www.youtube.com/@channelname" --output custom.md
+
+Cloudflare R2 (optional, set in .env; if R2_BUCKET is unset, files stay local):
+    R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET,
+    R2_FOLDER (key prefix, e.g. tubelens), R2_ENDPOINT_URL (optional override)
+    Each result is uploaded as <R2_FOLDER>/<Category>/<YouTubeID>_<PascalCaseName>.md
+    where Category is picked from R2_CATEGORIES (below) by Claude, based on the content.
 
 Cost: ~$0.50-1.00 for a 200-video channel (with prompt caching, default models).
 Single-video mode is essentially free (one Haiku call, fractions of a cent).
@@ -100,6 +106,10 @@ TRANSCRIPT_TRUNCATE = 25_000  # most videos repeat themselves; first 25k capture
 # so the worker functions (fetch_transcript / summarize_one) can read it without
 # threading an extra arg through the ThreadPoolExecutor plumbing.
 CACHE_DIR = Path(".channel_cache")
+
+# YouTube channel ID (UC...), captured from yt-dlp's channel listing. Used as the
+# unique-ID part of the R2 filename in channel mode.
+CHANNEL_ID = ""
 
 
 @dataclass
@@ -176,6 +186,7 @@ def _video_meta(video: Video) -> dict:
 
 def list_channel_videos(channel_url: str, skip_shorts: bool = False) -> list[Video]:
     """Use yt-dlp's flat-playlist mode to list every video without downloading."""
+    global CHANNEL_ID
     base = channel_url.rstrip("/").removesuffix("/videos").removesuffix("/shorts")
     tabs = [(f"{base}/videos", False)]
     if not skip_shorts:
@@ -235,6 +246,8 @@ def list_channel_videos(channel_url: str, skip_shorts: bool = False) -> list[Vid
             print(f"[list]   skipped ({type(e).__name__}: {e})")
             continue
 
+        if not CHANNEL_ID and info:
+            CHANNEL_ID = info.get("channel_id") or ""
         before = len(videos)
         walk_entries(info, is_short)
         print(f"[list]   found {len(videos) - before} entries in this tab")
@@ -712,6 +725,156 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
     return final
 
 
+# ---------- Publish results to Cloudflare R2 ----------
+
+def _pascal(text: str) -> str:
+    """'deep work & attention' -> 'DeepWorkAttention'. ASCII letters/digits only,
+    no whitespace or punctuation; already-PascalCase input passes through."""
+    return "".join(w[:1].upper() + w[1:] for w in re.findall(r"[A-Za-z0-9]+", text))[:60]
+
+
+# Folder categories under R2_FOLDER. Claude picks exactly one per result from this
+# list based on its content. Edit freely; keep names PascalCase (they become folder
+# names). Results that fit none (or when the call fails) go to R2_DEFAULT_CATEGORY.
+R2_CATEGORIES = {
+    "Technology": "software, programming, AI, gadgets, internet",
+    "Science": "physics, biology, space, nature, research",
+    "Health": "medicine, nutrition, fitness, sleep, mental health",
+    "Finance": "investing, markets, economics, crypto, personal finance",
+    "Business": "startups, entrepreneurship, marketing, management, careers",
+    "SelfImprovement": "productivity, habits, learning, mindset, motivation",
+    "Education": "tutorials, how-to, lectures, courses, explainers",
+    "NewsAndPolitics": "current events, politics, policy, geopolitics, commentary",
+    "HistoryAndCulture": "history, philosophy, religion, society, arts, books",
+    "Entertainment": "comedy, gaming, film, music, sports, pop culture",
+    "Lifestyle": "cooking, travel, home, DIY, fashion, relationships",
+}
+R2_DEFAULT_CATEGORY = "Uncategorized"
+
+
+def _cat_norm(text: str) -> str:
+    """Forgiving comparison: 'News & Politics' == 'NewsAndPolitics'."""
+    return re.sub(r"[^a-z0-9]", "", text.lower()).replace("and", "")
+
+
+def category_for(yt_id: str, title: str, context: str) -> str:
+    """Pick the R2 folder category for this content. Cached per ID (like the
+    friendly name) so re-runs land in the same folder; a cached value that is no
+    longer in R2_CATEGORIES is re-evaluated. Failures are not cached."""
+    cache_file = CACHE_DIR / f"{yt_id}.category.json"
+    if cache_file.exists():
+        try:
+            cat = json.loads(cache_file.read_text()).get("category", "")
+            if cat in R2_CATEGORIES or cat == R2_DEFAULT_CATEGORY:
+                return cat
+        except Exception:
+            pass  # Corrupt cache - regenerate
+
+    options = "\n".join(f"- {k}: {v}" for k, v in R2_CATEGORIES.items())
+    prompt = (
+        "Pick the single best category for this YouTube content, judged by its main subject.\n\n"
+        f"Categories:\n{options}\n\n"
+        "Reply with only the category name exactly as written. "
+        f"If none fit, reply {R2_DEFAULT_CATEGORY}.\n\n"
+        f"Title: {title}\n\n{context[:3000]}"
+    )
+    try:
+        resp = make_client().messages.create(
+            model=MAP_MODEL,
+            max_tokens=2000,  # thinking + reply share this budget
+            messages=[{"role": "user", "content": prompt}],
+        )
+        answer = _cat_norm(response_text(resp).splitlines()[0])
+        for cat in (*R2_CATEGORIES, R2_DEFAULT_CATEGORY):
+            if answer == _cat_norm(cat):
+                cache_file.write_text(json.dumps({"category": cat}))
+                return cat
+        print(f"[r2] unrecognized category {answer!r}; using {R2_DEFAULT_CATEGORY}")
+    except Exception as e:
+        print(f"[r2] category lookup failed ({type(e).__name__}: {e}); using {R2_DEFAULT_CATEGORY}")
+    return R2_DEFAULT_CATEGORY
+
+
+def friendly_name(yt_id: str, kind: str, title: str, context: str) -> str:
+    """Short PascalCase name describing what the content is about (not the raw
+    title). Generated once with the map model and cached so the R2 key stays
+    stable across re-runs; falls back to the PascalCased title if the call fails."""
+    cache_file = CACHE_DIR / f"{yt_id}.name.json"
+    if cache_file.exists():
+        try:
+            name = json.loads(cache_file.read_text()).get("name", "")
+            if name:
+                return name
+        except Exception:
+            pass  # Corrupt cache - regenerate
+
+    prompt = (
+        f"Give a short file name for this YouTube {kind}. Rules: 2-5 words, PascalCase, "
+        "letters and digits only (no spaces, hyphens, underscores or punctuation), max 40 "
+        "characters. Capture the core subject semantically - do NOT copy the title or channel "
+        "name, and avoid filler words like Video, Summary, Channel. Reply with only the name.\n\n"
+        f"Title: {title}\n\n{context[:3000]}"
+    )
+    try:
+        resp = make_client().messages.create(
+            model=MAP_MODEL,
+            max_tokens=2000,  # thinking + reply share this budget
+            messages=[{"role": "user", "content": prompt}],
+        )
+        name = _pascal(response_text(resp).splitlines()[0])
+        if name:
+            cache_file.write_text(json.dumps({"name": name}))
+            return name
+    except Exception as e:
+        print(f"[r2] name generation failed ({type(e).__name__}: {e}); using title")
+    return _pascal(title) or "Untitled"
+
+
+def publish_to_r2(path: Path, yt_id: str, title: str, context: str, kind: str) -> str:
+    """Upload `path` to R2 as <R2_FOLDER>/<Category>/<yt_id>_<FriendlyName>.md. No-op when
+    R2_BUCKET is unset. Never raises: the local file is already written, so an
+    upload problem is reported and the run still succeeds. Returns the key or ""."""
+    cfg = {
+        k: os.environ.get(f"R2_{k}", "").strip()
+        for k in ("BUCKET", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "ACCOUNT_ID", "ENDPOINT_URL", "FOLDER")
+    }
+    if not cfg["BUCKET"]:
+        return ""
+    missing = [k for k in ("ACCESS_KEY_ID", "SECRET_ACCESS_KEY") if not cfg[k]]
+    if not (cfg["ACCOUNT_ID"] or cfg["ENDPOINT_URL"]):
+        missing.append("ACCOUNT_ID")
+    if missing:
+        print("[r2] skipped - missing in .env: " + ", ".join(f"R2_{k}" for k in missing))
+        return ""
+
+    try:
+        import boto3  # lazy: only needed when R2 is configured
+
+        name = friendly_name(yt_id, kind, title, context)
+        category = category_for(yt_id, title, context)
+        key = "/".join(
+            p for p in (cfg["FOLDER"].strip("/"), category, f"{yt_id}_{name}.md") if p
+        )
+        client = boto3.client(
+            "s3",
+            endpoint_url=cfg["ENDPOINT_URL"] or f"https://{cfg['ACCOUNT_ID']}.r2.cloudflarestorage.com",
+            aws_access_key_id=cfg["ACCESS_KEY_ID"],
+            aws_secret_access_key=cfg["SECRET_ACCESS_KEY"],
+            region_name="auto",
+        )
+        client.put_object(
+            Bucket=cfg["BUCKET"],
+            Key=key,
+            Body=path.read_bytes(),
+            ContentType="text/markdown; charset=utf-8",
+        )
+        print(f"[r2] uploaded {cfg['BUCKET']}/{key}")
+        return key
+    except Exception as e:
+        print(f"[r2] upload failed ({type(e).__name__}: {e}); local file kept at {path}")
+        return ""
+
+
 # ---------- Single-video detailed summary ----------
 
 DETAILED_SUMMARY_PROMPT = """You are an expert content summarizer and technical writer. Your task is to analyze the following YouTube video transcript and provide a clear, well-structured, and comprehensive summary.
@@ -861,6 +1024,8 @@ def process_single_video(
         parts += ["## Summary", "", summary, ""]
     parts += ["## Transcript", "", video.transcript, ""]
     output_path.write_text("\n".join(parts))
+    publish_to_r2(output_path, video.video_id, video.title or video_id,
+                  summary or video.transcript, "video")
     return summary
 
 
@@ -1022,6 +1187,9 @@ def main():
 
     out_path = _derive_output_path(args.channel_url, args.output, len(videos), args.limit)
     final = synthesize(videos, out_path, model=reduce_model)
+    if any(v.summary and v.summary != "SKIP" for v in videos):  # skip the "no synthesis" stub
+        handle = _channel_handle(args.channel_url)
+        publish_to_r2(out_path, CHANNEL_ID or handle, handle, final, "channel")
     print(f"\n[done] wrote {out_path}")
     if len(final) > 4000:
         print(f"\n{'=' * 60} preview (full output in {out_path}) {'=' * 60}")
