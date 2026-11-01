@@ -70,9 +70,28 @@ except ImportError:  # pragma: no cover
 
 # ---------- Models ----------
 
-MAP_MODEL = "claude-haiku-4-5-20251001"   # cheap per-video summaries
-REDUCE_MODEL = "claude-opus-4-7"          # final synthesis (best quality)
-REDUCE_MODEL_CHEAP = "claude-sonnet-4-6"  # ~5x cheaper, good for iterating on prompt
+MAP_MODEL = "claude-haiku-5-5"       # fastest, economical per-video summaries
+REDUCE_MODEL = "claude-opus-5-5"    # highest-quality channel synthesis
+REDUCE_MODEL_CHEAP = "claude-sonnet-5-5"  # best balance of quality and cost
+
+def make_client() -> Anthropic:
+    """Anthropic client. If ANTHROPIC_WORKSPACE_ID is set (needed for API keys
+    that aren't scoped to a workspace), send it as the anthropic-workspace-id header."""
+    # ws_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    # if ws_id:
+    #     return Anthropic(default_headers={"anthropic-workspace-id": ws_id})
+    return Anthropic()
+
+
+def response_text(resp) -> str:
+    """Join the text blocks of a response. Claude 5.x models think by default, so
+    content[0] can be a ThinkingBlock (no .text). Raises if there is no text, e.g.
+    thinking used up max_tokens."""
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+    if not text:
+        raise ValueError(f"no text in response (stop_reason={resp.stop_reason})")
+    return text
+
 
 MIN_TRANSCRIPT_CHARS = 400  # skip videos with near-empty transcripts (noise)
 TRANSCRIPT_TRUNCATE = 25_000  # most videos repeat themselves; first 25k captures thesis
@@ -241,7 +260,7 @@ def fetch_video_metadata(video_id: str, is_short_hint: bool = False) -> Video:
     duration <= 60s as a proxy (YouTube's own short threshold).
     """
     url = f"https://www.youtube.com/watch?v={video_id}"
-    ydl_opts = {"quiet": True, "skip_download": True, "ignoreerrors": True}
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "ignoreerrors": True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
@@ -492,13 +511,13 @@ def summarize_one(client: Anthropic, video: Video) -> Video:
         try:
             resp = client.messages.create(
                 model=MAP_MODEL,
-                max_tokens=400,
+                max_tokens=4000,  # thinking + reply share this budget
                 messages=[{
                     "role": "user",
                     "content": _map_user_content(video, transcript),
                 }],
             )
-            video.summary = resp.content[0].text.strip()
+            video.summary = response_text(resp)
             cache_file.write_text(json.dumps({
                 **_video_meta(video),
                 "summary": video.summary,
@@ -507,13 +526,14 @@ def summarize_one(client: Anthropic, video: Video) -> Video:
         except Exception as e:
             if attempt == 2:
                 video.error = f"map failed: {e}"
+                print(f"[summary] map summary failed: {e}")
                 return video
             time.sleep(2 ** attempt)
     return video
 
 
 def summarize_all(videos: list[Video], workers: int = 4) -> list[Video]:
-    client = Anthropic()
+    client = make_client()
     have_transcript = [v for v in videos if v.transcript]
     out_map = {v.video_id: v for v in videos}
 
@@ -648,7 +668,7 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
             chunks.append("\n\n".join(current))
         print(f"[reduce] channel too large for one pass — splitting into {len(chunks)} chunks")
 
-    client = Anthropic()
+    client = make_client()
     partials = []
     for i, chunk in enumerate(chunks, 1):
         print(f"[reduce] synthesizing chunk {i}/{len(chunks)} with {model}")
@@ -660,7 +680,7 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
                 "content": REDUCE_PROMPT.format(n=len(summarized), summaries=chunk),
             }],
         )
-        partials.append(resp.content[0].text)
+        partials.append(response_text(resp))
 
     if len(partials) == 1:
         final = partials[0]
@@ -678,7 +698,7 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
             max_tokens=16000,
             messages=[{"role": "user", "content": merge_prompt}],
         )
-        final = resp.content[0].text
+        final = response_text(resp)
 
     output_path.write_text(final)
     # Write manifest so the next run can detect an unchanged summary set and
@@ -692,7 +712,75 @@ def synthesize(videos: list[Video], output_path: Path, model: str = REDUCE_MODEL
     return final
 
 
-def process_single_video(video_id: str, is_short_hint: bool, output_path: Path) -> str:
+# ---------- Single-video detailed summary ----------
+
+DETAILED_SUMMARY_PROMPT = """You are an expert content summarizer and technical writer. Your task is to analyze the following YouTube video transcript and provide a clear, well-structured, and comprehensive summary.
+
+Please structure your response using the following guidelines:
+
+1. **Overview / Executive Summary:** A concise 2-3 sentence paragraph capturing the core thesis, main takeaway, or purpose of the video.
+2. **Key Themes & Subtopics:** Organize the body of the summary using clear sub-headers (##) corresponding to the major topics or chronological sections discussed in the video. Under each sub-header, use bullet points to highlight:
+   - Important concepts, arguments, or data points.
+   - Actionable advice, steps, or recommendations (if applicable).
+   - Notable quotes or examples mentioned.
+3. **Key Takeaways / Conclusion:** A brief concluding section summarizing the ultimate message or call to action for the viewer.
+
+Guidelines for formatting and tone:
+- Maintain an objective, professional, and engaging tone.
+- Ensure the sub-headers are descriptive and easy to scan at a glance.
+- Do not include filler words or repetitive text.
+
+Here is the transcript:
+[PASTE TRANSCRIPT HERE]"""
+
+DETAILED_TRANSCRIPT_MAX = 400_000  # chars (~100k tokens); safety cap for very long videos
+
+
+def detailed_summary_one(client: Anthropic, video: Video, model: str) -> str:
+    """Run DETAILED_SUMMARY_PROMPT over the full transcript. Cached on disk per
+    video + model. Returns "" on failure (error is stored in video.error)."""
+    cache_file = CACHE_DIR / f"{video.video_id}.detailed.json"
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            if data.get("model") == model and data.get("detailed_summary"):
+                return data["detailed_summary"]
+        except Exception:
+            pass  # Corrupt cache — regenerate
+
+    # str.replace, not .format — transcripts can contain braces.
+    prompt = DETAILED_SUMMARY_PROMPT.replace(
+        "[PASTE TRANSCRIPT HERE]", video.transcript[:DETAILED_TRANSCRIPT_MAX]
+    )
+    for attempt in range(3):
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=16000,  # thinking + reply share this budget
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response_text(resp)
+            cache_file.write_text(json.dumps({
+                **_video_meta(video),
+                "model": model,
+                "detailed_summary": text,
+            }, indent=2, ensure_ascii=False))
+            return text
+        except Exception as e:
+            if attempt == 2:
+                video.error = f"detailed summary failed: {e}"
+                print(f"[summary] detailed summary failed: {e}")
+                return ""
+            time.sleep(2 ** attempt)
+    return ""
+
+
+def process_single_video(
+    video_id: str,
+    is_short_hint: bool,
+    output_path: Path,
+    model: str = REDUCE_MODEL_CHEAP,
+) -> str:
     """Single-video pipeline: metadata -> transcript -> summary. No reduce step.
 
     Writes a markdown file with the metadata, summary, and full transcript so
@@ -744,9 +832,14 @@ def process_single_video(video_id: str, is_short_hint: bool, output_path: Path) 
         summary = ""
     else:
         print("[summary] generating summary")
-        client = Anthropic()
+        client = make_client()
         video = summarize_one(client, video)
         summary = video.summary
+
+        print(f"[summary] generating detailed summary with {model}")
+        detailed = detailed_summary_one(client, video, model)
+        if detailed:
+            summary = f"{summary}\n\n{detailed}" if summary else detailed
 
     # Build a self-contained markdown report. Order: metadata, summary, then
     # transcript at the bottom (long, mostly for reference).
@@ -897,11 +990,12 @@ def main():
         print(f"[cache] using {CACHE_DIR}/")
 
         out_path = Path(args.output) if args.output else Path(f"{video_id}_result.md")
-        summary = process_single_video(video_id, is_short_hint, out_path)
+        #summary = process_single_video(video_id, is_short_hint, out_path, model=reduce_model)
+        process_single_video(video_id, is_short_hint, out_path, model=reduce_model)
         print(f"\n[done] wrote {out_path}")
-        if summary:
-            print("\n" + "=" * 60)
-            print(summary)
+        # if summary:
+        #     print("\n" + "=" * 60)
+        #     print(summary)
         return
 
     # Per-channel cache dir, e.g. ".channel_cache/hubermanlab/" — keeps cached
