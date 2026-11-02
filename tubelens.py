@@ -37,7 +37,7 @@ Override:
 Cloudflare R2 (optional, set in .env; if R2_BUCKET is unset, files stay local):
     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET,
     R2_FOLDER (key prefix, e.g. tubelens), R2_ENDPOINT_URL (optional override)
-    Each result is uploaded as <R2_FOLDER>/<Category>/<YouTubeID>_<PascalCaseName>.md
+    Each result is uploaded as <R2_FOLDER>/<Category>/<ChannelName>/<YouTubeID>_<PascalCaseName>.md
     where Category is picked from R2_CATEGORIES (below) by Claude, based on the content.
 
 Cost: ~$0.50-1.00 for a 200-video channel (with prompt caching, default models).
@@ -53,6 +53,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import yt_dlp
@@ -122,6 +123,7 @@ class Video:
     transcript: str = ""
     summary: str = ""
     error: str = ""
+    channel: str = ""  # channel handle/name; only set in single-video mode (used for the R2 folder)
 
 
 def video_url(video: Video) -> str:
@@ -294,6 +296,7 @@ def fetch_video_metadata(video_id: str, is_short_hint: bool = False) -> Video:
         upload_date=str(info.get("upload_date", "") or ""),
         duration=duration,
         is_short=is_short,
+        channel=(info.get("uploader_id") or "").lstrip("@") or info.get("channel") or "",
     )
 
 
@@ -830,8 +833,8 @@ def friendly_name(yt_id: str, kind: str, title: str, context: str) -> str:
     return _pascal(title) or "Untitled"
 
 
-def publish_to_r2(path: Path, yt_id: str, title: str, context: str, kind: str) -> str:
-    """Upload `path` to R2 as <R2_FOLDER>/<Category>/<yt_id>_<FriendlyName>.md. No-op when
+def publish_to_r2(path: Path, yt_id: str, title: str, context: str, kind: str, channel: str = "") -> str:
+    """Upload `path` to R2 as <R2_FOLDER>/<Category>/<channel>/<yt_id>_<FriendlyName>.md. No-op when
     R2_BUCKET is unset. Never raises: the local file is already written, so an
     upload problem is reported and the run still succeeds. Returns the key or ""."""
     cfg = {
@@ -852,8 +855,9 @@ def publish_to_r2(path: Path, yt_id: str, title: str, context: str, kind: str) -
 
         name = friendly_name(yt_id, kind, title, context)
         category = category_for(yt_id, title, context)
+        channel_dir = re.sub(r"[^A-Za-z0-9_.-]", "_", channel) or "UnknownChannel"
         key = "/".join(
-            p for p in (cfg["FOLDER"].strip("/"), category, f"{yt_id}_{name}.md") if p
+            p for p in (cfg["FOLDER"].strip("/"), category, channel_dir, f"{yt_id}_{name}.md") if p
         )
         client = boto3.client(
             "s3",
@@ -1017,7 +1021,8 @@ def process_single_video(
         f"**URL:** {video_url(video)}  ",
         f"**Type:** {fmt}  ",
         f"**Duration:** {duration_str}  ",
-        f"**Uploaded:** {video.upload_date or 'unknown'}",
+        f"**Uploaded:** {video.upload_date or 'unknown'}  ",
+        f"**GeneratedDate:** {date.today().isoformat()}",
         "",
     ]
     if summary:
@@ -1025,7 +1030,7 @@ def process_single_video(
     parts += ["## Transcript", "", video.transcript, ""]
     output_path.write_text("\n".join(parts))
     publish_to_r2(output_path, video.video_id, video.title or video_id,
-                  summary or video.transcript, "video")
+                  summary or video.transcript, "video", video.channel)
     return summary
 
 
@@ -1189,7 +1194,7 @@ def main():
     final = synthesize(videos, out_path, model=reduce_model)
     if any(v.summary and v.summary != "SKIP" for v in videos):  # skip the "no synthesis" stub
         handle = _channel_handle(args.channel_url)
-        publish_to_r2(out_path, CHANNEL_ID or handle, handle, final, "channel")
+        publish_to_r2(out_path, CHANNEL_ID or handle, handle, final, "channel", handle)
     print(f"\n[done] wrote {out_path}")
     if len(final) > 4000:
         print(f"\n{'=' * 60} preview (full output in {out_path}) {'=' * 60}")

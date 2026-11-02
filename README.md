@@ -121,7 +121,7 @@ python tubelens.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 python tubelens.py dQw4w9WgXcQ
 ```
 
-Output is `<video_id>_result.md` (override with `--output`): metadata, a structured summary (Haiku), a detailed summary (the `--reduce-model` model), and the full transcript. Transcripts under 400 characters are not summarized. Cached in `.channel_cache/_videos/`.
+Output is `<video_id>_result.md` (override with `--output`): metadata (title, URL, type, duration, uploaded date, and `GeneratedDate`, the date the file was written), a structured summary (Haiku), a detailed summary (the `--reduce-model` model), and the full transcript. Transcripts under 400 characters are not summarized. Cached in `.channel_cache/_videos/`.
 
 ### Cloudflare R2 upload (optional)
 
@@ -138,8 +138,9 @@ R2_FOLDER=tubelens
 
 Create the access key as an R2 API token with Object Read & Write on the bucket. `R2_FOLDER` is the key prefix (leave it empty for the bucket root). If `R2_BUCKET` is unset, nothing is uploaded; if it is set but a credential is missing, `tubelens` says which one and skips the upload.
 
-Files land at `<R2_FOLDER>/<Category>/<YouTubeID>_<PascalCaseName>.md`, e.g. `tubelens/Health/UCxxxxxxxxxxxx_SleepAndCircadianBiology.md`:
+Files land at `<R2_FOLDER>/<Category>/<ChannelName>/<YouTubeID>_<PascalCaseName>.md`, e.g. `tubelens/Health/hubermanlab/UCxxxxxxxxxxxx_SleepAndCircadianBiology.md`:
 
+- **ChannelName:** the channel handle (e.g. `hubermanlab`). In single-video mode it comes from the video's uploader handle, falling back to the channel title, then `UnknownChannel`. Unsafe characters become `_`.
 - **YouTubeID:** the video ID in single-video mode, the channel ID (`UC…`) in channel mode.
 - **PascalCaseName:** a short Haiku call names what the content is about (2–5 words, no spaces), rather than copying the video or channel title. If the call fails, the PascalCased title is used.
 - **Category:** the same Haiku model picks one folder from `R2_CATEGORIES` in `tubelens.py`, based on the content. A channel gets one category, based on its whole synthesis. Anything that fits none (or a failed lookup) goes to `Uncategorized`.
@@ -223,7 +224,7 @@ For people who want to understand and customize.
   ┌──────────────────────────────────────────────────────────┐
   │ 5. PUBLISH    Cloudflare R2 via boto3                    │
   │               Haiku picks a name + a category folder     │
-  │               <R2_FOLDER>/<Category>/<ID>_<Name>.md      │
+  │               <R2_FOLDER>/<Cat>/<Channel>/<ID>_<Name>.md │
   └──────────────────────────────────────────────────────────┘
 ```
 
